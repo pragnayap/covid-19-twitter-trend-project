@@ -1,12 +1,8 @@
 # COVID-19 Vaccine Tweet Analysis Pipeline
 
-A complete end-to-end data pipeline that ingests publicly available COVID-19 vaccine tweet data, extracts and counts hashtags, sends Slack notifications, and visualizes trends in Kibana.
+An end-to-end data pipeline that ingests publicly available COVID-19 vaccine tweet data, extracts and counts hashtags, sends Slack notifications, and visualizes trends in Kibana.
 
-## Project Overview
-
-This project builds a data pipeline using Apache Airflow, Google BigQuery, Google Cloud Storage, Slack, and Kibana to analyze trending hashtags in COVID-19 vaccine related tweets.
-
-## Tools Used
+## Tools
 
 | Tool | Purpose |
 |---|---|
@@ -23,53 +19,88 @@ This project builds a data pipeline using Apache Airflow, Google BigQuery, Googl
 - **File:** `vaccination_all_tweets.csv`
 - **Size:** ~90MB
 - **Records:** ~130,000 tweets
-- **Key columns:** `id`, `user_name`, `date`, `text`, `hashtags`, `retweets`, `favorites`
+- **Columns:** `id`, `user_name`, `date`, `text`, `hashtags`, `retweets`, `favorites` and more
+
+A 100-row sample is included in `dags/vaccination_sample.csv` for testing.
+
+To get the full dataset:
+1. Go to https://www.kaggle.com/datasets/gpreda/all-covid19-vaccines-tweets
+2. Download `vaccination_all_tweets.csv`
+3. Place it in the `dags/` folder
 
 ## Pipeline Architecture
 
 ```
 vaccination_all_tweets.csv
           ↓
-    validate_csv_file        ← checks file exists and is non-empty
+    validate_csv_file        checks file exists and is non-empty
           ↓
-    upload_csv_to_gcs        ← uploads to Google Cloud Storage
+    upload_csv_to_gcs        uploads to Google Cloud Storage
           ↓
-    create_bq_dataset        ← creates BigQuery dataset if needed
+    create_bq_dataset        creates BigQuery dataset if needed
           ↓
-    create_raw_table         ← creates partitioned + clustered table
+    create_raw_table         creates partitioned + clustered table
           ↓
-    gcs_to_bigquery          ← incrementally loads data into BigQuery
+    gcs_to_bigquery          loads data into BigQuery
           ↓
-    create_hashtag_table     ← creates hashtag counts table
+    create_hashtag_table     creates hashtag counts table
           ↓
-    analyze_hashtags         ← extracts and counts hashtags from tweets
+    analyze_hashtags         extracts and counts hashtags from tweets
           ↓
-[notify_success] / [notify_failure]  ← Slack notification
+    push_to_elasticsearch    pushes results to Elasticsearch (BigQuery-Kibana bridge)
+          ↓
+[notify_success] / [notify_failure]   Slack notification
+```
+
+## Project Structure
+
+```
+airflow/
+├── dags/
+│   ├── config.py                   # all configuration variables
+│   ├── helpers.py                  # reusable helper functions
+│   ├── twitter_pipeline.py         # main Airflow DAG
+│   └── vaccination_sample.csv      # 100-row sample dataset
+├── logs/
+├── plugins/
+├── config/
+├── Dockerfile                      # custom image with providers pre-installed
+├── docker-compose.yaml             # all services including Elasticsearch and Kibana
+├── .env.template                   # environment variables template
+├── .gitignore
+├── run_pipeline.sh                 # one-command startup script
+├── README.md
+├── SETUP.md
+├── PIPELINE.md
+└── CHALLENGES.md
 ```
 
 ## Key Features
 
 ### Incremental Loading
-Data is loaded using `WRITE_APPEND` so each pipeline run only adds new records rather than reloading everything. Tables are partitioned by date to make incremental queries efficient.
+Data is loaded using `WRITE_TRUNCATE` so each pipeline run replaces data with fresh counts. Tables are partitioned by date and clustered for faster queries.
+
+### BigQuery to Kibana Bridge
+Since no native BigQuery-Kibana connector exists, a custom Python bridge task (`push_to_elasticsearch`) queries BigQuery and pushes results directly into Elasticsearch after every run. Kibana always shows live data without any manual steps.
 
 ### Optimization
 - Raw tweets table partitioned by `date` field
 - Hashtag counts table partitioned by `timestamp`
 - Both tables clustered for faster queries
-- BigQuery queries use standard SQL with CTEs for readability
+- BigQuery queries use CTEs for readability and performance
 
 ### Error Handling
 - File validation before pipeline starts
 - 3 retries with exponential backoff on task failure
+- 15 minute execution timeout per task
 - Slack failure notification when any task fails
-- Try/catch blocks in all Python functions
 
 ### Code Modularization
 - `config.py` — all configuration variables in one place
-- `helpers.py` — reusable functions for Slack and validation
-- `twitter_pipeline.py` — main DAG using modular imports
+- `helpers.py` — reusable functions for Slack, validation and Elasticsearch
+- `twitter_pipeline.py` — main DAG importing from config and helpers
 
-## Top Trending Hashtags Found
+## Top Findings
 
 | Hashtag | Count | Percentage |
 |---|---|---|
@@ -83,48 +114,45 @@ Data is loaded using `WRITE_APPEND` so each pipeline run only adds new records r
 
 **Total hashtag mentions analyzed: 11,281,494**
 
-## Project Structure
+## Kibana Dashboard
 
-```
-airflow/
-├── dags/
-│   ├── config.py                   # configuration variables
-│   ├── helpers.py                  # reusable helper functions
-│   ├── twitter_pipeline.py         # main Airflow DAG
-│   └── vaccination_all_tweets.csv  # source dataset
-├── logs/
-├── plugins/
-├── config/
-├── Dockerfile                      # custom image with providers
-├── docker-compose.yaml
-└── .env
-```
+4 visualizations built on live BigQuery data:
+- Bar chart — top 20 hashtags by frequency
+- Pie chart — proportional hashtag distribution
+- Data table — hashtag counts with percentages
+- Word cloud — visual representation of popularity
 
-## Results
+## Quick Start
 
-- Successfully loaded ~130,000 tweets into BigQuery
-- Extracted and counted hashtags from tweet text and hashtags column
-- Built Kibana dashboard with 4 visualizations:
-  - Bar chart of top 20 hashtags
-  - Pie chart of hashtag distribution
-  - Data table with counts and percentages
-  - Word cloud of trending hashtags
+### Prerequisites
+- Docker Desktop installed and running
+- GCP service account key JSON file
+- Slack webhook URL
 
-## Dataset Setup
+### Setup
+1. Clone this repository
+2. Copy `.env.template` to `.env` and fill in your values
+3. Place your GCP key file as `gcp-key.json` in the project root
+4. Download the full dataset from Kaggle and place in `dags/` folder
+5. Update `config.py` with your `PROJECT_ID`, `BUCKET_NAME` and `SLACK_WEBHOOK`
 
-The full dataset is not included due to size (90MB).
-
-### Option 1 — Download from Kaggle
-1. Go to: https://www.kaggle.com/datasets/gpreda/all-covid19-vaccines-tweets
-2. Download `vaccination_all_tweets.csv`
-3. Place it in the `dags/` folder
-
-### Option 2 — Use Kaggle CLI
+### Run
 ```bash
-pip install kaggle
-kaggle datasets download -d gpreda/all-covid19-vaccines-tweets
-unzip all-covid19-vaccines-tweets.zip -d ./dags/
+bash run_pipeline.sh
 ```
 
-### Sample Dataset
-A 100-row sample is included in `dags/vaccination_sample.csv` for testing.
+This starts all Docker containers, triggers the pipeline and opens Airflow, Kibana and Slack.
+
+### Manual Trigger
+```bash
+cd ~/airflow/airflow
+docker compose exec --user airflow airflow-scheduler airflow dags unpause covid_vaccine_tweet_pipeline
+docker compose exec --user airflow airflow-scheduler airflow dags trigger covid_vaccine_tweet_pipeline
+```
+
+### Access UIs
+| Service | URL |
+|---|---|
+| Airflow | http://localhost:8080 |
+| Kibana | http://localhost:5601 |
+| Elasticsearch | http://localhost:9200 |

@@ -1,12 +1,8 @@
 # Pipeline Technical Documentation
 
-This document explains the technical design decisions, implementation details, and rubric-aligned features of the COVID-19 Vaccine Tweet Analysis Pipeline.
+## Overview
 
----
-
-## 1. Pipeline Overview
-
-The pipeline consists of 9 tasks organized in a linear dependency chain:
+The pipeline consists of 10 tasks in a linear dependency chain:
 
 ```
 validate_csv_file
@@ -23,40 +19,56 @@ create_hashtag_table
       ↓
 analyze_hashtags
       ↓
+push_to_elasticsearch
+      ↓
 [notify_success] / [notify_failure]
 ```
 
 ---
 
-## 2. Incremental Loading
+## 1. Data Ingestion
 
-The pipeline uses `WRITE_APPEND` instead of `WRITE_TRUNCATE` so each run only adds new records:
+### validate_csv_file
+Checks the CSV file exists and is non-empty before starting any GCP operations. Raises `FileNotFoundError` or `ValueError` if validation fails, stopping the pipeline early.
 
-```python
-load_to_bq = GCSToBigQueryOperator(
-    write_disposition="WRITE_APPEND",  # incremental — append only
-    ...
-)
-```
+### upload_csv_to_gcs
+Uploads `vaccination_all_tweets.csv` (90MB) from the Airflow container to Google Cloud Storage using `LocalFilesystemToGCSOperator`. Has a 15 minute execution timeout to handle large file uploads.
 
-Tables are partitioned by date so BigQuery only scans relevant partitions:
+### create_bq_dataset
+Creates the `twitter_trends` BigQuery dataset if it doesn't already exist. Uses `exists_ok=True` so re-runs don't fail.
+
+---
+
+## 2. Table Schema and Mappings
+
+### create_raw_table
+Creates the raw tweets table with partitioning and clustering using `CREATE TABLE IF NOT EXISTS`:
 
 ```sql
-CREATE TABLE IF NOT EXISTS `project.dataset.table`
+CREATE TABLE IF NOT EXISTS `project.twitter_trends.vaccination_tweets`
+(
+    id               STRING,
+    user_name        STRING,
+    user_location    STRING,
+    user_description STRING,
+    user_created     TIMESTAMP,
+    user_followers   INTEGER,
+    user_friends     INTEGER,
+    user_favourites  INTEGER,
+    user_verified    BOOL,
+    date             TIMESTAMP,
+    text             STRING,
+    hashtags         STRING,
+    source           STRING,
+    retweets         INTEGER,
+    favorites        INTEGER,
+    is_retweet       BOOL
+)
 PARTITION BY DATE(date)
 CLUSTER BY user_name;
 ```
 
-This means:
-- Queries filtering by date scan less data
-- Each pipeline run adds to existing data rather than replacing it
-- Historical data is preserved across runs
-
----
-
-## 3. Table Schema and Mappings
-
-### Raw Tweets Table (`vaccination_tweets`)
+### Raw Tweets Table (vaccination_tweets)
 
 | Column | Type | Description |
 |---|---|---|
@@ -77,7 +89,7 @@ This means:
 | favorites | INTEGER | Like count |
 | is_retweet | BOOLEAN | Whether it is a retweet |
 
-### Hashtag Counts Table (`hashtag_counts`)
+### Hashtag Counts Table (hashtag_counts)
 
 | Column | Type | Description |
 |---|---|---|
@@ -87,9 +99,24 @@ This means:
 
 ---
 
+## 3. Incremental Loading
+
+Data is loaded using `WRITE_TRUNCATE` which replaces the table on each run ensuring clean consistent data:
+
+```python
+load_to_bq = GCSToBigQueryOperator(
+    write_disposition="WRITE_TRUNCATE",
+    ...
+)
+```
+
+Tables are partitioned by date so BigQuery only scans relevant partitions when querying by date range, reducing query cost and improving performance.
+
+---
+
 ## 4. Hashtag Extraction Logic
 
-Hashtags are extracted from two sources and combined:
+Hashtags are extracted from two sources and combined using `UNION ALL`:
 
 ```sql
 -- Source 1: hashtags column stores values like ['PfizerBioNTech', 'COVID19']
@@ -99,7 +126,7 @@ WITH from_hashtag_col AS (
             LOWER(hashtags),
             r"'([a-z0-9_]+)'"
         ) AS tags
-    FROM `project.dataset.vaccination_tweets`
+    FROM `project.twitter_trends.vaccination_tweets`
     WHERE hashtags IS NOT NULL
       AND hashtags != '[]'
 ),
@@ -111,7 +138,7 @@ from_text AS (
             LOWER(text),
             r'(#[a-z0-9_]+)'
         ) AS tags
-    FROM `project.dataset.vaccination_tweets`
+    FROM `project.twitter_trends.vaccination_tweets`
     WHERE text IS NOT NULL
 ),
 
@@ -124,8 +151,8 @@ all_tags AS (
 )
 
 SELECT
-    tag             AS hashtag,
-    COUNT(*)        AS count,
+    tag                 AS hashtag,
+    COUNT(*)            AS count,
     CURRENT_TIMESTAMP() AS timestamp
 FROM all_tags
 WHERE tag IS NOT NULL
@@ -143,7 +170,7 @@ Both tables are partitioned by date fields:
 - `vaccination_tweets` partitioned by `DATE(date)`
 - `hashtag_counts` partitioned by `DATE(timestamp)`
 
-This reduces query cost and improves performance since BigQuery only scans relevant date partitions.
+Partitioning means BigQuery only scans relevant date partitions, reducing query cost and improving performance.
 
 ### Table Clustering
 - `vaccination_tweets` clustered by `user_name`
@@ -163,17 +190,17 @@ Clustering physically organizes data so queries filtering by these fields run fa
 ### Task-Level Retries
 ```python
 default_args = {
-    "retries": 3,
-    "retry_delay": timedelta(minutes=2),
+    "retries":                   3,
+    "retry_delay":               timedelta(minutes=2),
     "retry_exponential_backoff": True,
-    "max_retry_delay": timedelta(minutes=30),
+    "max_retry_delay":           timedelta(minutes=30),
+    "execution_timeout":         timedelta(minutes=15),
 }
 ```
 
-Retries use exponential backoff — 2min, 4min, 8min — capped at 30 minutes.
+Retries use exponential backoff — 2min, 4min, 8min — capped at 30 minutes. Each task also has a 15 minute execution timeout.
 
 ### File Validation
-Before any GCP operations, the pipeline validates the CSV file:
 ```python
 def validate_csv_file(file_path):
     if not os.path.exists(file_path):
@@ -185,10 +212,9 @@ def validate_csv_file(file_path):
 ```
 
 ### Slack Notifications
-Both success and failure states send Slack notifications:
 ```python
 notify_success = PythonOperator(
-    trigger_rule="all_success",  # only runs if all tasks succeed
+    trigger_rule="all_success",  # runs only if all tasks succeed
     ...
 )
 
@@ -199,7 +225,6 @@ notify_failure = PythonOperator(
 ```
 
 ### Logging
-All helper functions use Python's logging module:
 ```python
 logger = logging.getLogger(__name__)
 logger.info("File validated successfully")
@@ -213,42 +238,35 @@ logger.error(f"Slack notification failed: {e}")
 The code is split into 3 files:
 
 ### config.py
-Central configuration file. All variables are defined once here and imported everywhere:
-```python
-PROJECT_ID    = "twitter-trend-project-491803"
-DATASET_NAME  = "twitter_trends"
-BUCKET_NAME   = "covid-tweets-bucket"
-```
+All configuration variables defined once and imported everywhere. Changing a value like `PROJECT_ID` only needs to be done in one place.
 
 ### helpers.py
-Reusable utility functions:
-- `send_slack_notification()` — sends formatted Slack messages
+Three reusable functions:
+- `send_slack_notification()` — sends formatted Slack messages with error handling
 - `validate_csv_file()` — validates file before pipeline starts
+- `push_hashtags_to_elasticsearch()` — BigQuery to Elasticsearch bridge
 
 ### twitter_pipeline.py
 Main DAG file that imports from config and helpers:
 ```python
 from config import PROJECT_ID, DATASET_NAME, ...
-from helpers import send_slack_notification, validate_csv_file
+from helpers import send_slack_notification, validate_csv_file, push_hashtags_to_elasticsearch
 ```
-
-This separation means:
-- Config changes only need to be made in one place
-- Helper functions can be reused across multiple DAGs
-- Main DAG file stays clean and readable
 
 ---
 
 ## 8. BigQuery to Kibana Bridge
 
-Instead of manually exporting CSV files, we built a Python bridge function as a dedicated Airflow task that automatically pushes data from BigQuery into Elasticsearch after every pipeline run:
+Since no native BigQuery-Kibana connector exists, we built a custom Python bridge as a dedicated Airflow task:
 
 ```python
 def push_hashtags_to_elasticsearch(project_id, dataset, table, es_host, es_index):
     client = bigquery.Client(project=project_id)
-    results = client.query(f"SELECT hashtag, count FROM `{project_id}.{dataset}.{table}` ORDER BY count DESC LIMIT 50").result()
+    results = client.query(
+        f"SELECT hashtag, count FROM `{project_id}.{dataset}.{table}` ORDER BY count DESC LIMIT 50"
+    ).result()
 
-    # Create index with correct field mappings
+    # Delete old index and recreate with correct field mappings
     requests.delete(f"{es_host}/{es_index}")
     requests.put(f"{es_host}/{es_index}", json={
         "mappings": {
@@ -259,22 +277,24 @@ def push_hashtags_to_elasticsearch(project_id, dataset, table, es_host, es_index
         }
     })
 
-    # Push each row into Elasticsearch
     for row in results:
-        requests.post(f"{es_host}/{es_index}/_doc", json={"hashtag": row.hashtag, "count": row.count})
+        requests.post(f"{es_host}/{es_index}/_doc",
+                     json={"hashtag": row.hashtag, "count": row.count})
 ```
 
-This means Kibana always shows **live data** from BigQuery without any manual steps.
+This means Kibana always shows live data from BigQuery automatically after every pipeline run.
+
+---
 
 ## 9. Kibana Dashboard
 
-Data flows automatically from BigQuery into Kibana via the Elasticsearch bridge with 4 visualizations:
+4 visualizations built on live BigQuery data via Elasticsearch:
 
 | Visualization | Type | Insight |
 |---|---|---|
-| Top Hashtags Bar Chart | Vertical Bar | Shows top 20 hashtags by frequency |
-| Hashtag Distribution Pie | Donut Pie | Shows proportional share of each hashtag |
-| Hashtag Counts Table | Data Table | Lists all hashtags with counts and percentages |
+| Top Hashtags Bar Chart | Vertical Bar | Top 20 hashtags by frequency |
+| Hashtag Distribution Pie | Donut Pie | Proportional share of each hashtag |
+| Hashtag Counts Table | Data Table | All hashtags with counts and percentages |
 | Word Cloud | Tag Cloud | Visual representation of hashtag popularity |
 
 ### Top Findings

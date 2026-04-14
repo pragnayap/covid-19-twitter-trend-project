@@ -1,9 +1,6 @@
 # Environment Setup Guide
 
-This document covers the setup of all tools required for the COVID-19 Vaccine Tweet Analysis Pipeline.
-
 ## Prerequisites
-
 - Mac with Docker Desktop installed
 - Google Cloud Platform account (free tier works)
 - Kaggle account (for dataset download)
@@ -11,39 +8,33 @@ This document covers the setup of all tools required for the COVID-19 Vaccine Tw
 
 ---
 
-## 1. Docker and Airflow Setup
-
-### Install Docker Desktop
-Download and install Docker Desktop from https://docker.com. Make sure it is running before proceeding.
-
-### Start Airflow
+## 1. Clone the Repository
 ```bash
-mkdir airflow && cd airflow
-curl -LfO 'https://airflow.apache.org/docs/apache-airflow/stable/docker-compose.yaml'
-mkdir -p ./dags ./logs ./plugins ./config
-echo "AIRFLOW_UID=$(id -u)" > .env
-echo "AIRFLOW_GID=0" >> .env
-docker compose up airflow-init
-docker compose up -d
-```
-
-Open Airflow at http://localhost:8080 (username: airflow, password: airflow)
-
-### Install Google Provider
-Add this line to your `.env` file:
-```
-_PIP_ADDITIONAL_REQUIREMENTS=apache-airflow-providers-google
-```
-
-Or build a custom Docker image using the provided Dockerfile:
-```bash
-docker compose build
-docker compose up -d
+git clone https://github.com/YOUR_USERNAME/covid-vaccine-tweet-pipeline.git
+cd covid-vaccine-tweet-pipeline
 ```
 
 ---
 
-## 2. Google Cloud Platform Setup
+## 2. Dataset Setup
+
+Download the dataset from Kaggle:
+1. Go to https://www.kaggle.com/datasets/gpreda/all-covid19-vaccines-tweets
+2. Download `vaccination_all_tweets.csv`
+3. Place it in the `dags/` folder
+
+Or use Kaggle CLI:
+```bash
+pip install kaggle
+kaggle datasets download -d gpreda/all-covid19-vaccines-tweets
+unzip all-covid19-vaccines-tweets.zip -d ./dags/
+```
+
+A 100-row sample is included in `dags/vaccination_sample.csv` for testing.
+
+---
+
+## 3. Google Cloud Platform Setup
 
 ### Create Project
 1. Go to https://console.cloud.google.com
@@ -60,6 +51,7 @@ Go to APIs & Services → Library and enable:
 2. Create a service account named `airflow-pipeline-sa`
 3. Assign roles: `BigQuery Admin` and `Storage Admin`
 4. Generate and download a JSON key file
+5. Place it in the project root as `gcp-key.json`
 
 ### Create BigQuery Dataset
 1. Go to BigQuery in GCP Console
@@ -74,79 +66,34 @@ Go to APIs & Services → Library and enable:
 
 ---
 
-## 3. Airflow GCP Connection Setup
-
-1. Open Airflow UI at http://localhost:8080
-2. Go to Admin → Connections → +
-3. Fill in:
-   - Connection ID: `google_cloud_default`
-   - Connection Type: `Google Cloud`
-   - Keyfile Path: `/opt/airflow/gcp-key.json`
-4. Copy the JSON key into the container:
-```bash
-docker cp ~/Downloads/your-key-file.json airflow-airflow-worker-1:/opt/airflow/gcp-key.json
-docker cp ~/Downloads/your-key-file.json airflow-airflow-scheduler-1:/opt/airflow/gcp-key.json
-```
-5. Click Test to verify the connection
-6. Click Save
-
----
-
 ## 4. Slack Setup
-
 1. Create a Slack workspace at https://slack.com
 2. Create a channel named `#twitter-trend-alerts`
 3. Go to https://api.slack.com/apps
 4. Create a new app → From scratch
 5. Enable Incoming Webhooks
 6. Add webhook to `#twitter-trend-alerts` channel
-7. Copy the webhook URL and paste it into `config.py` as `SLACK_WEBHOOK`
+7. Copy the webhook URL
 
 ---
 
-## 5. Dataset Setup
+## 5. Environment Configuration
 
-Download the dataset from Kaggle:
+Copy the template and fill in your values:
 ```bash
-pip install kaggle
-kaggle datasets download -d gpreda/all-covid19-vaccines-tweets
-unzip all-covid19-vaccines-tweets.zip -d ./dags/
+cp .env.template .env
 ```
 
-Or download manually from:
-https://www.kaggle.com/datasets/gpreda/all-covid19-vaccines-tweets
-
-Place `vaccination_all_tweets.csv` in the `./dags/` folder.
-
----
-
-## 6. Kibana Setup
-
-```bash
-docker run -d --name elasticsearch \
-  -p 9200:9200 \
-  -e "discovery.type=single-node" \
-  -e "xpack.security.enabled=false" \
-  -e "ES_JAVA_OPTS=-Xms256m -Xmx256m" \
-  elasticsearch:8.11.0
-
-sleep 40
-
-docker run -d --name kibana \
-  -p 5601:5601 \
-  -e "ELASTICSEARCH_HOSTS=http://elasticsearch:9200" \
-  -e "xpack.security.enabled=false" \
-  --link elasticsearch:elasticsearch \
-  kibana:8.11.0
+Edit `.env`:
+```
+AIRFLOW_UID=501
+AIRFLOW_GID=0
+GOOGLE_APPLICATION_CREDENTIALS=/opt/airflow/gcp-key.json
+AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false
+AIRFLOW__CORE__LOAD_EXAMPLES=false
 ```
 
-Open Kibana at http://localhost:5601
-
----
-
-## 7. Update Configuration
-
-Open `dags/config.py` and update:
+Update `dags/config.py`:
 ```python
 PROJECT_ID    = "your-gcp-project-id"
 BUCKET_NAME   = "your-bucket-name"
@@ -155,12 +102,100 @@ SLACK_WEBHOOK = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
 
 ---
 
+## 6. Docker and Airflow Setup
+
+### Install Docker Desktop
+Download from https://docker.com and make sure it is running.
+
+### Build and Start
+```bash
+docker compose build
+docker compose up airflow-init
+docker compose up -d
+```
+
+### Verify all containers are healthy
+```bash
+docker compose ps
+```
+
+You should see these containers all showing healthy:
+- `airflow-apiserver`
+- `airflow-scheduler`
+- `airflow-dag-processor`
+- `airflow-worker`
+- `airflow-triggerer`
+- `postgres`
+- `redis`
+- `elasticsearch`
+- `kibana`
+
+---
+
+## 7. Airflow GCP Connection Setup
+1. Open http://localhost:8080 (username: `airflow`, password: `airflow`)
+2. Go to Admin → Connections → +
+3. Fill in:
+   - **Connection ID:** `google_cloud_default`
+   - **Connection Type:** `Google Cloud`
+   - **Keyfile Path:** `/opt/airflow/gcp-key.json`
+4. Click Test to verify
+5. Click Save
+
+---
+
 ## 8. Running the Pipeline
 
-1. Place all DAG files in `./dags/` folder
-2. Open Airflow UI at http://localhost:8080
-3. Find `covid_vaccine_tweet_pipeline`
-4. Enable the DAG using the toggle
-5. Click Trigger DAG
-6. Watch tasks turn green one by one
-7. Check Slack for success notification
+### Option 1 — One command (recommended)
+```bash
+bash run_pipeline.sh
+```
+
+This starts all containers, triggers the DAG and opens all UIs automatically.
+
+### Option 2 — Manual
+```bash
+cd ~/airflow/airflow
+docker compose up -d
+sleep 40
+docker compose exec --user airflow airflow-scheduler airflow dags unpause covid_vaccine_tweet_pipeline
+docker compose exec --user airflow airflow-scheduler airflow dags trigger covid_vaccine_tweet_pipeline
+open http://localhost:8080
+open http://localhost:5601
+```
+
+---
+
+## 9. Access UIs
+
+| Service | URL | Credentials |
+|---|---|---|
+| Airflow | http://localhost:8080 | airflow / airflow |
+| Kibana | http://localhost:5601 | none required |
+| Elasticsearch | http://localhost:9200 | none required |
+| BigQuery | https://console.cloud.google.com/bigquery | GCP account |
+
+---
+
+## 10. Stopping Everything
+```bash
+cd ~/airflow/airflow
+docker compose down
+```
+
+To stop and delete all data volumes:
+```bash
+docker compose down -v
+```
+
+---
+
+## Troubleshooting
+
+| Issue | Fix |
+|---|---|
+| DAG is paused after restart | Run `airflow dags unpause covid_vaccine_tweet_pipeline` |
+| GCP credentials not found | Copy key file: `docker cp gcp-key.json airflow-airflow-worker-1:/opt/airflow/gcp-key.json` |
+| Elasticsearch out of memory | Increase Docker Desktop memory to 6GB in Settings → Resources |
+| upload_csv_to_gcs timeout | File is already in GCS — check bucket and re-trigger |
+| Kibana can't connect | Wait 2 minutes after starting — Elasticsearch needs time to start |
