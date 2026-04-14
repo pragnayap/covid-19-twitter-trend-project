@@ -1,0 +1,23 @@
+# GCP credentials - NEVER upload
+gcp-key.json
+*.json
+
+# Large data files - too big for GitHub
+dags/vaccination_all_tweets.csv
+
+# Sensitive environment variables
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+dags/__pycache__/
+
+# Airflow logs
+logs/
+
+# Docker volumes
+postgres-db-volume/
+elasticsearch-data/
+kibana-data/
